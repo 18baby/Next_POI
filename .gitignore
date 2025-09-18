@@ -1,0 +1,21 @@
+
+data/ca/ 
+
+EDA/**/cache/
+EDA/NYC/Taxi/
+
+*.parquet
+*.dbf
+*.shp
+*.shx
+*.sbn
+*.sbx
+*.xml
+
+# 주피터/파이썬
+**/.ipynb_checkpoints/
+**/__pycache__/
+
+# OS & 기타
+.DS_Store
+EOF
