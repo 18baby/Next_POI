@@ -20,7 +20,7 @@ from param_parser import parameter_parser
 from dataloader import load_graph_adj_mtx, load_graph_node_features
 
 from my_model import UserShortPrefMemory, UserLongPrefMemory, UserEmb_Merge, df_to_pyg_data, POIEmbedding, POIEncoderGCN, POIMergeGate, \
-    CatEmbedding, TimeEmbedding, CheckInFusion
+    CatEmbedding, TimeEmbedding, CheckInFusion, PFA, NextPOIWithPFA
 
 from utils import increment_path, calculate_laplacian_matrix, zipdir, top_k_acc_last_timestep, \
     mAP_metric_last_timestep, MRR_metric_last_timestep, maksed_mse_loss
@@ -265,6 +265,10 @@ def train(args):
     # ===== 5. 최종 check-in 임베딩 생성 모델 =====
     check_in_fusion_model = CheckInFusion(poi_dim=args.poi_dim, time_dim=args.time_dim, space_dim=args.space_dim, cat_dim=args.cat_dim, out_dim=args.input_tok_dim)
     
+    
+    # ===== 6. 예측 모델 (GPT2) =====
+    pfa = PFA()
+    model = NextPOIWithPFA(pfa=pfa, num_pois=num_pois)    # 최종 예측 모델
     
     
     

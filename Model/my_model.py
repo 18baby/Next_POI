@@ -8,6 +8,8 @@ import geohash2
 from torch_geometric.nn import GCNConv, GATConv
 from torch_geometric.data import Data
 from torch_geometric.utils import to_undirected, add_self_loops, coalesce
+from transformers import GPT2Model, GPT2Config
+from peft import get_peft_model, LoraConfig, PrefixTuningConfig, TaskType
 
 
 # --- 단기 선호도 ---
@@ -469,3 +471,131 @@ class CheckInFusion(nn.Module):
         if squeeze_p:
             out = out.squeeze(1)
         return out
+    
+    
+# PFA 구현
+class PFA(nn.Module):
+    """
+    GPT-2를 PFA 스타일로 학습:
+    - 앞쪽 (gpt_layers - U) 블록: 거의 동결 (LN만 학습 옵션)
+    - 마지막 U 블록: 어텐션 위주 학습(기본). LoRA 가능.
+    - 필요 시 MLP 동결 유지(권장) 또는 해제도 가능.
+    - 다음 토큰을 예측
+    """
+    def __init__(self,
+                 gpt_name: str = "gpt2",
+                 gpt_layers: int = 12,     # 사용할 블록 수 (<= 사전학습 모델 깊이) -> (원래 12층)
+                 U: int = 3,               # 마지막 U개 블록을 더 적극적으로 학습
+                 train_early_ln: bool = True,        # 앞쪽 블록에서 ln_1/ln_2 학습 허용
+                 train_pos_emb_early: bool = False,  # 포지셔널 임베딩 학습 여부 앞단에서 학습할지 여부
+                 train_final_ln: bool = True,        # 최상단 ln_f(출력 레이어노름)를 학습 여부
+                 train_last_mlp: bool = False,       # 마지막 U 블록의 MLP를 학습할지 (기본 False 권장)
+                 use_lora: bool = False,    # LoRA 사용 여부 (권장)
+                 lora_r: int = 8,
+                 lora_alpha: int = 16,
+                 lora_dropout: float = 0.1,
+                 lora_targets=("c_attn", "c_proj"),  # GPT-2에서 어텐션 관련 모듈
+                 output_attentions: bool = False,
+                 output_hidden_states: bool = False):
+        super().__init__()
+
+        # GPT-2 모델 불러오기
+        self.gpt = GPT2Model.from_pretrained(
+            gpt_name,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+        assert gpt_layers <= self.gpt.config.n_layer, "gpt_layers가 모델 깊이보다 클 수 없습니다."
+        self.gpt.h = self.gpt.h[:gpt_layers]  # Transformer 블록 수 맞춤
+        self.gpt.config.n_layer = gpt_layers  # config도 맞춰줌
+        self.last_start = gpt_layers - U      # 마지막 U개 블록의 시작 인덱스
+
+        # 1) 기본적으로 전체 동결
+        for p in self.gpt.parameters():
+            p.requires_grad = False
+
+        # 2) 앞쪽 블록들: layer norm만 학습 허용(옵션)
+        if train_early_ln:
+            for li in range(0, self.last_start):
+                blk = self.gpt.h[li]
+                for name, p in blk.named_parameters():
+                    if name.startswith("ln_"):   # ln_1, ln_2
+                        p.requires_grad = True
+
+        # 3) positional embedding(wpe)와 token embedding(wte)
+        #    - 보통 동결이 안정적. (필요 시만 켜세요)
+        if train_pos_emb_early:
+            for p in self.gpt.wpe.parameters():
+                p.requires_grad = True
+        # wte는 inputs_embeds를 직접 주므로 사용하지 않지만, 혹시 쓸 경우를 대비해 기본은 동결 유지
+
+        # 4) 마지막 U개 블록: 어텐션 위주 학습
+        for li in range(self.last_start, gpt_layers):
+            blk = self.gpt.h[li]
+            for name, p in blk.named_parameters():
+                if ("attn" in name) or (train_last_mlp and "mlp" in name):
+                    p.requires_grad = True
+                # layer norm은 기본 동결 or 위에서 켰으면 이미 True일 수 있음
+
+        # 5) 최종 레이어노름(탑레벨 ln_f)
+        if train_final_ln:
+            for p in self.gpt.ln_f.parameters():
+                p.requires_grad = True
+
+        # 6) LoRA 장착 (권장). 전 블록에 장착 후, 마지막 U개 블록의 LoRA만 학습 허용
+        self.use_lora = use_lora
+        if use_lora:
+            peft_cfg = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=list(lora_targets),  # 예: c_attn, c_proj
+            )
+            self.gpt = get_peft_model(self.gpt, peft_cfg)
+            # LoRA 모듈은 target_modules에 모두 삽입됨 → 마지막 U 블록만 학습하도록 필터링
+            for name, p in self.gpt.named_parameters():
+                if "lora_" in name:
+                    # 이름에 h.{li}. 이 포함되면 해당 블록의 LoRA
+                    keep = any(f"h.{li}." in name for li in range(self.last_start, gpt_layers))
+                    p.requires_grad = keep  # 마지막 U 블록의 LoRA만 학습
+
+    def forward(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor | None = None):
+        """
+        inputs_embeds: (B, L, H)  # 예: H=768
+        """
+        out = self.gpt(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+        return out.last_hidden_state  # (B, L, H)
+
+    def trainable_parameters(self):
+        """ Optimizer에 물릴 파라미터만 반환 """
+        return [p for p in self.gpt.parameters() if p.requires_grad]
+
+# 최종 Next POI 예측기
+class NextPOIWithPFA(nn.Module):
+    def __init__(self, pfa: PFA, num_pois: int):
+        super().__init__()
+        self.pfa = pfa   # PFA 모듈
+        self.readout = nn.Linear(self.pfa.gpt.config.hidden_size, num_pois)   # 최종 POI 예측
+
+    # 다음 토큰 예측용 시프트드 크로스엔트로피 손실
+    @staticmethod
+    def shifted_ce_loss(logits, labels, mask):
+        B, L, V = logits.shape
+        pred = logits[:, :-1, :].contiguous()
+        gold = labels[:, 1:].contiguous()
+        m    = mask[:, 1:].contiguous().float()
+        loss = nn.functional.cross_entropy(pred.reshape(-1, V), gold.reshape(-1),
+                                           reduction="none").reshape(B, L-1)
+        return (loss * m).sum() / m.sum().clamp_min(1.0)
+
+    def forward(self, inputs_embeds, attention_mask, labels=None):
+        h = self.pfa(inputs_embeds, attention_mask)     # (B, L, H)
+        logits = self.readout(h)                        # (B, L, V)
+        if labels is None:
+            return logits, None
+        loss = self.shifted_ce_loss(logits, labels, attention_mask)
+        return logits, loss
+
+    def trainable_parameters(self):
+        return self.pfa.trainable_parameters() + list(self.readout.parameters())
