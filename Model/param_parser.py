@@ -120,7 +120,7 @@ def parameter_parser():
                         help='Batch size.')
     parser.add_argument('--epochs',
                         type=int,
-                        default=200,
+                        default=100,
                         help='Number of epochs to train.')
     parser.add_argument('--lr',
                         type=float,

@@ -1,5 +1,4 @@
 import logging
-import logging
 import os
 import pathlib
 import pickle
@@ -14,12 +13,15 @@ import torch.optim as optim
 import yaml
 from sklearn.preprocessing import OneHotEncoder
 from torch.nn.utils.rnn import pad_sequence
+from torch_geometric.data import Data
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-
-from dataloader import load_graph_adj_mtx, load_graph_node_features
-from model import GCN, NodeAttnMap, UserEmbeddings, Time2Vec, CategoryEmbeddings, FuseEmbeddings, TransformerModel
 from param_parser import parameter_parser
+from dataloader import load_graph_adj_mtx, load_graph_node_features
+
+from my_model import UserShortPrefMemory, UserLongPrefMemory, UserEmb_Merge, df_to_pyg_data, POIEmbedding, POIEncoderGCN, POIMergeGate, \
+    CatEmbedding, TimeEmbedding, CheckInFusion
+
 from utils import increment_path, calculate_laplacian_matrix, zipdir, top_k_acc_last_timestep, \
     mAP_metric_last_timestep, MRR_metric_last_timestep, maksed_mse_loss
     
@@ -60,12 +62,6 @@ def train(args):
     train_df = pd.read_csv(args.train_data_path)
     val_df = pd.read_csv(args.val_data_path)
     
-    # POI 그래프 로드
-    logging.info("Loading POI graphs...")
-    poi_space_G = pd.read_csv(args.poi_space_graph)  # POI 인접성 공간 그래프
-    poi_time_G = pd.read_csv(args.poi_time_graph)    # POI 유사 체크인 시간 그래프
-    poi_traj_G = pd.read_csv(args.poi_traj_graph)    # POI 전이 그래프
-    
     # Geohash 임베딩 로드
     logging.info("Loading geohash embeddings...")
     space_emb = pd.read_csv(args.geohash_embedding)
@@ -79,6 +75,7 @@ def train(args):
     
     poi_id2idx = {pid: idx for idx, pid in enumerate(poi_ids)}    # POI ID -> index
     cat_id2idx = {cid: idx for idx, cid in enumerate(cat_ids)}    # 카테고리 ID -> index
+    user_id2idx = {uid: idx for idx, uid in enumerate(user_set)}  # 사용자 ID -> index
 
     num_pois = len(poi_ids)
     num_users = len(train_df['UserId'].unique())     # 일단은 training 데이터의 사용자들만 확인
@@ -91,8 +88,19 @@ def train(args):
                             val_df[['PoiId', 'PoiCategoryId', 'Latitude', 'Longitude']]
                         ]).drop_duplicates().reset_index(drop=True)
     
-    # 사용자 단기 선호도 저장 dict 생성
-    user_short_pre_dict = {uid: None for uid in user_set}
+    # POI 그래프 로드
+    logging.info("Loading POI graphs...")
+    poi_space_G = pd.read_csv(args.poi_space_graph)  # POI 인접성 공간 그래프
+    poi_time_G = pd.read_csv(args.poi_time_graph)    # POI 유사 체크인 시간 그래프
+    poi_traj_G = pd.read_csv(args.poi_traj_graph)    # POI 전이 그래프
+    
+    # 각 POI 그래프를 PyG Data 객체로 변환
+    poi_space_data = df_to_pyg_data(poi_space_G, poi_id2idx, device=args.device)
+    poi_time_data = df_to_pyg_data(poi_time_G, poi_id2idx, device=args.device)
+    poi_traj_data = df_to_pyg_data(poi_traj_G, poi_id2idx, device=args.device)
+
+    # 사용자 단기 선호도 저장 dict 생성 -> 이것 보다 class로 받아오는데 좋음
+    #user_short_pre_dict = {uid: None for uid in user_set}
 
     logging.info(f"poi_info shape: {poi_info.shape}")
 
@@ -104,11 +112,18 @@ def train(args):
         def __init__(self, train_df):
             self.df = train_df
             self.traj_seqs = []   # traj id 저장
+            self.user_idxs = []   # 사용자 인덱스 저장
             self.input_seqs = []  # 각 traj id 별 input 시퀀스 저장
             self.label_seqs = []  # 각 traj id 별 label 시퀀스 저장
 
             for traj_id in tqdm(set(train_df['TrajectoryId'].tolist())):
                 traj_df = train_df[train_df['TrajectoryId'] == traj_id]    # traj_id 별로 그룹핑
+                
+                user_id = traj_df['UserId'].iloc[0]      # 사용자 정보 먼저 추출
+                if user_id not in user_set:               # 일단 신규 사용자는 무시
+                    continue
+                user_idx = user_id2idx[user_id]
+                
                 poi_ids = traj_df['PoiId'].to_list()                       # 해당 traj_id 내 check-in POI 리스트     
                 poi_idxs = [poi_id2idx[each] for each in poi_ids]          # POI ID -> index
                 
@@ -129,6 +144,7 @@ def train(args):
                     continue
 
                 self.traj_seqs.append(traj_id)
+                self.user_idxs.append(user_idx)
                 self.input_seqs.append(input_seq)
                 self.label_seqs.append(label_seq)
 
@@ -137,7 +153,7 @@ def train(args):
             return len(self.traj_seqs)
 
         def __getitem__(self, index):
-            return (self.traj_seqs[index], self.input_seqs[index], self.label_seqs[index])
+            return (self.traj_seqs[index], self.user_idxs[index], self.input_seqs[index], self.label_seqs[index])
 
     class TrajectoryDatasetVal(Dataset):
         """
@@ -146,6 +162,7 @@ def train(args):
         def __init__(self, df):
             self.df = df
             self.traj_seqs = []
+            self.user_idxs = []
             self.input_seqs = []
             self.label_seqs = []
 
@@ -155,6 +172,7 @@ def train(args):
                 # 일단 신규 사용자는 무시
                 if user_id not in user_set:
                     continue
+                user_idx = user_id2idx[user_id]
 
                 # Get POIs idx in this trajectory
                 traj_df = df[df['TrajectoryId'] == traj_id]
@@ -188,13 +206,14 @@ def train(args):
                 self.input_seqs.append(input_seq)
                 self.label_seqs.append(label_seq)
                 self.traj_seqs.append(traj_id)
+                self.user_idxs.append(user_idx)
 
         def __len__(self):
             assert len(self.input_seqs) == len(self.label_seqs) == len(self.traj_seqs)
             return len(self.traj_seqs)
 
         def __getitem__(self, index):
-            return (self.traj_seqs[index], self.input_seqs[index], self.label_seqs[index])
+            return (self.traj_seqs[index], self.user_idxs[index], self.input_seqs[index], self.label_seqs[index])
     
     # %% ====================== Define dataloader ======================
     # Traj 단위로 배치 생성 -> (batch당 Traj 개수는 args.batch) -> padding은 배치 내에서 진행하면 됨
@@ -216,8 +235,35 @@ def train(args):
     # %% ====================== Build Models ======================
     print('Building models...')
     
+    # ===== 1. 사용자 임베딩 생성 =====
+    user_short_mem = UserShortPrefMemory(num_users=num_users, dim=args.user_short_dim)      # 사용자별 단기 선호도 임베딩
+    user_long_mem = UserLongPrefMemory(num_users=num_users, dim=args.user_long_dim)         # 사용자별 장기 선호도 임베딩
+
+    # 사용자 장, 단기 임베딩을 결합해 최종 사용자 임베딩 생성
+    user_embed_model = UserEmb_Merge(short_dim = args.user_short_dim, long_dim = args.user_long_dim, out_dim = args.input_tok_dim)   
+
+
+    # ===== 2. POI 임베딩 생성 =====
+    poi_emb = POIEmbedding(num_pois=num_pois, dim=args.poi_emb_dim)
+    
+    # 3가지 view의 POI 임베딩 생성
+    poi_space_encoder = POIEncoderGCN(in_dim = args.poi_dim, hid_dim = args.poi_dim, out_dim = args.poi_dim)
+    poi_time_encoder = POIEncoderGCN(in_dim = args.poi_dim, hid_dim = args.poi_dim, out_dim = args.poi_dim)
+    poi_traj_encoder = POIEncoderGCN(in_dim = args.poi_dim, hid_dim = args.poi_dim, out_dim = args.poi_dim)
+    
+    # 최종 POI 임베딩 생성 모델 -> 각 view의 POI 임베딩을 결합(가중치를 학습해 가중합으로 결합 + 잔차 연결)
+    poi_embed_model = POIMergeGate(dim = args.poi_dim)
     
     
+    # ===== 3. Category 임베딩 생성 =====
+    cat_emb = CatEmbedding(num_cats=num_cats, dim=args.cat_dim)
+    
+    
+    # ===== 4. Time 임베딩 생성 모델 =====
+    time_embed_model = TimeEmbedding(dim=args.time_dim)
+    
+    # ===== 5. 최종 check-in 임베딩 생성 모델 =====
+    check_in_fusion_model = CheckInFusion(poi_dim=args.poi_dim, time_dim=args.time_dim, space_dim=args.space_dim, cat_dim=args.cat_dim, out_dim=args.input_tok_dim)
     
     
     
